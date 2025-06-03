@@ -1,0 +1,653 @@
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from tkinter import Tk, Label, Entry, Listbox, Scrollbar, Frame, messagebox, Canvas, Text, filedialog, Checkbutton, BooleanVar, Button
+import tkinter as tk
+from PIL import Image, ImageTk
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+
+#  Ứng dụng này là một giao diện người dùng đồ họa (GUI) để xử lý ảnh với nhiều bộ lọc khác nhau.
+# - Sử dụng thư viện tkinter để tạo giao diện.
+# - Sử dụng OpenCV (cv2) để xử lý ảnh.
+# - Tận dụng xử lý đa luồng (ThreadPoolExecutor) để tăng hiệu suất khi áp dụng bộ lọc.
+# - Tích hợp bộ nhớ đệm (cache) để tối ưu tải ảnh và matplotlib để hiển thị biểu đồ histogram.
+# - Hiển thị thời gian xử lý cho mỗi bộ lọc.
+# - Cho phép người dùng chọn thư mục lưu kết quả.
+# - Cho phép người dùng chọn và lưu các ảnh đã lọc cụ thể.
+# - Lưu ảnh kết quả với kích thước đầy đủ và tên file theo tên bộ lọc.
+
+class ImageProcessingApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Ứng dụng xử lý ảnh")
+        self.image_folder = ""
+        self.output_folder = ""
+        self.current_output_folder = "" # Stores the specific subfolder for the current image
+        self.image_list = []
+        self.selected_image_path = None # Store path of the selected image
+        self.selected_image_data = None # Store cv2 image data of the selected image
+        self.processed_images = {} # Stores {'filter_name': {'image': data, 'time_ms': time}}
+        self.image_checkboxes = {} # Stores {'filter_name': BooleanVar} for checkboxes
+
+        self.executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 1)
+        self.image_cache = {}
+        self.cache_size_limit = 10
+
+        self.setup_gui()
+        self.is_processing = False
+
+    def setup_gui(self):
+        main_container = Frame(self.root)
+        main_container.pack(expand=True, fill=tk.BOTH, padx=10, pady=10)
+
+        control_frame = Frame(main_container)
+        control_frame.pack(pady=10, fill=tk.X)
+
+        Label(control_frame, text="Thư mục chứa ảnh:").pack(anchor='w')
+        image_folder_entry_frame = Frame(control_frame)
+        image_folder_entry_frame.pack(fill=tk.X, pady=(0, 5))
+
+        self.folder_entry = Entry(image_folder_entry_frame, width=50)
+        self.folder_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+        Button(image_folder_entry_frame, text="Tải ảnh", command=self.load_images).pack(side=tk.LEFT)
+
+        Label(control_frame, text="Thư mục lưu kết quả:").pack(anchor='w', pady=(5, 0))
+        output_folder_frame = Frame(control_frame)
+        output_folder_frame.pack(fill=tk.X, pady=(0, 5)) # Reduced pady to make space for button
+
+        self.output_folder_entry = Entry(output_folder_frame, width=50)
+        self.output_folder_entry.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 5))
+        self.browse_output_button = Button(output_folder_frame, text="Chọn thư mục",
+                                              command=self.browse_output_folder)
+        self.browse_output_button.pack(side=tk.LEFT)
+
+        # --- Moved "Lưu ảnh đã chọn" button here ---
+        self.save_selected_button = Button(control_frame, text="Lưu ảnh đã chọn", command=self.save_selected_images_threaded, height=2, bg="#4CAF50", fg="white", font=("Arial", 10, "bold"))
+        self.save_selected_button.pack(pady=10, anchor='center') # Added to control_frame
+
+        self.progress_label = Label(control_frame, text="")
+        self.progress_label.pack(pady=(5,0), anchor='w') # Adjusted pady
+
+        listbox_frame = Frame(main_container)
+        listbox_frame.pack(pady=5, fill=tk.BOTH, expand=True)
+
+        self.scrollbar = Scrollbar(listbox_frame, orient=tk.VERTICAL)
+        self.image_listbox = Listbox(listbox_frame, width=50, height=10, yscrollcommand=self.scrollbar.set)
+        self.scrollbar.config(command=self.image_listbox.yview)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.image_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.image_listbox.bind('<<ListboxSelect>>', self.on_image_select)
+
+        self.display_container = Frame(main_container)
+        self.display_container.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+
+        self.canvas = Canvas(self.display_container)
+        self.scrollbar_display_y = Scrollbar(self.display_container, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.scrollbar_display_x = Scrollbar(self.display_container, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.scrollable_frame = Frame(self.canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar_display_y.set, xscrollcommand=self.scrollbar_display_x.set)
+
+        self.scrollbar_display_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self.scrollbar_display_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.hist_frame = Frame(main_container, height=280)
+        self.hist_frame.pack(fill=tk.X, pady=10, side=tk.BOTTOM)
+        self.hist_frame.pack_propagate(False)
+
+        # The bottom_frame is no longer needed as the button has been moved.
+        # bottom_frame = Frame(main_container)
+        # bottom_frame.pack(pady=10, side=tk.BOTTOM, fill=tk.X)
+
+
+    def browse_output_folder(self):
+        directory = filedialog.askdirectory()
+        if directory:
+            self.output_folder_entry.delete(0, tk.END)
+            self.output_folder_entry.insert(0, directory)
+            self.output_folder = directory # Update self.output_folder directly
+
+    def load_images(self):
+        self.image_folder = self.folder_entry.get()
+        if not os.path.isdir(self.image_folder):
+            messagebox.showerror("Lỗi", "Đường dẫn thư mục ảnh không hợp lệ!")
+            return
+
+        self.image_listbox.delete(0, tk.END)
+        self.image_list = [f for f in os.listdir(self.image_folder)
+                           if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))]
+        self.image_listbox.insert(tk.END, *self.image_list)
+
+        if self.image_list:
+            threading.Thread(target=self._preload_images, daemon=True).start()
+
+    def _preload_images(self):
+        for i, img_name in enumerate(self.image_list[:3]): # Preload first 3 images
+            image_path = os.path.join(self.image_folder, img_name)
+            self._get_image_from_cache(image_path)
+            if i >= 2:
+                break
+
+    def _get_image_from_cache(self, image_path):
+        if image_path in self.image_cache:
+            return self.image_cache[image_path]
+
+        img = cv2.imread(image_path)
+        if img is None:
+            print(f"Warning: Could not read image {image_path}")
+            return None
+
+        if len(self.image_cache) >= self.cache_size_limit:
+            self.image_cache.pop(next(iter(self.image_cache))) # Remove oldest item
+        self.image_cache[image_path] = img
+        return img
+
+    def on_image_select(self, event):
+        if self.is_processing:
+            messagebox.showinfo("Đang xử lý", "Vui lòng đợi quá trình xử lý ảnh trước đó hoàn tất...")
+            return
+
+        selection = self.image_listbox.curselection()
+        if not selection:
+            return
+
+        self.selected_image_path = os.path.join(self.image_folder, self.image_listbox.get(selection[0]))
+        threading.Thread(target=self._process_selected_image_thread, daemon=True).start()
+
+    def _process_selected_image_thread(self):
+        self.is_processing = True
+        self.root.after(0, lambda: self.progress_label.config(text="Đang xử lý ảnh... Vui lòng đợi"))
+        self.root.after(0, lambda: self.save_selected_button.config(state=tk.DISABLED))
+
+
+        self.selected_image_data = self._get_image_from_cache(self.selected_image_path)
+
+        if self.selected_image_data is None:
+            self.root.after(0, lambda: messagebox.showerror("Lỗi", f"Không thể tải ảnh: {os.path.basename(self.selected_image_path)}"))
+            self.is_processing = False
+            self.root.after(0, lambda: self.progress_label.config(text="Lỗi tải ảnh."))
+            self.root.after(0, lambda: self.save_selected_button.config(state=tk.NORMAL))
+            return
+
+        # Determine and create output folder for the current image
+        user_defined_output_base = self.output_folder_entry.get().strip()
+        if not user_defined_output_base or not os.path.isdir(user_defined_output_base):
+            self.root.after(0, lambda: messagebox.showwarning(
+                "Chưa chọn thư mục lưu",
+                "Vui lòng chọn thư mục hợp lệ để lưu kết quả. Nếu không, ảnh sẽ không được lưu khi nhấn nút."
+            ))
+            # Allow processing but saving will fail if no valid path
+            self.output_folder = "" # Reset if invalid
+            self.current_output_folder = ""
+        else:
+            self.output_folder = user_defined_output_base
+
+        if self.output_folder: # Only create subfolder if base output folder is valid
+            image_base_name = os.path.splitext(os.path.basename(self.selected_image_path))[0]
+            self.current_output_folder = os.path.join(self.output_folder, image_base_name)
+            try:
+                os.makedirs(self.current_output_folder, exist_ok=True)
+            except OSError as e:
+                self.root.after(0, lambda: messagebox.showerror("Lỗi tạo thư mục",
+                                                                f"Không thể tạo thư mục con: {self.current_output_folder}\n{e}"))
+                self.current_output_folder = "" # Invalidate if creation fails
+        else:
+            self.current_output_folder = ""
+
+
+        self.processed_images = self.process_image_filters(self.selected_image_data)
+        self.root.after(0, self._update_ui_after_processing)
+
+    def _update_ui_after_processing(self):
+        # Clear previous checkboxes and image displays
+        self.image_checkboxes.clear()
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        for widget in self.hist_frame.winfo_children():
+            widget.destroy()
+
+        self._display_processed_images_with_checkboxes()
+        self.display_histogram() # Uses self.current_output_folder for saving histogram
+        self._display_processing_times()
+
+        self.progress_label.config(text="Xử lý hoàn tất!")
+        self.is_processing = False
+        self.save_selected_button.config(state=tk.NORMAL)
+
+
+    def _display_processing_times(self):
+        if not self.processed_images:
+            return
+
+        times_window = tk.Toplevel(self.root)
+        times_window.title("Thời gian xử lý bộ lọc")
+        times_window.geometry("450x350") # Adjusted size
+
+        padding_frame = Frame(times_window, padx=10, pady=10)
+        padding_frame.pack(expand=True, fill=tk.BOTH)
+
+        text_area = Text(padding_frame, wrap=tk.WORD, height=15, width=50, font=("Arial", 10))
+        scrollbar_times = Scrollbar(padding_frame, command=text_area.yview) # Renamed scrollbar
+        text_area.config(yscrollcommand=scrollbar_times.set)
+
+        text_area.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar_times.pack(side=tk.RIGHT, fill=tk.Y)
+
+        report = "Thời gian xử lý mỗi bộ lọc (ms):\n\n"
+        # Sort by filter name for consistent order
+        sorted_times = sorted(self.processed_images.items(), key=lambda item: item[0])
+
+        for name, data in sorted_times:
+            time_ms = data.get('time_ms', 0.0)
+            report += f"{name}: {time_ms:.2f} ms\n"
+
+        text_area.insert(tk.END, report)
+        text_area.config(state=tk.DISABLED) # Make text area read-only
+
+        # Center the window
+        times_window.update_idletasks()
+        root_x = self.root.winfo_x()
+        root_y = self.root.winfo_y()
+        root_width = self.root.winfo_width()
+        root_height = self.root.winfo_height()
+
+        win_width = times_window.winfo_width()
+        win_height = times_window.winfo_height()
+
+        x = root_x + (root_width // 2) - (win_width // 2)
+        y = root_y + (root_height // 2) - (win_height // 2)
+        times_window.geometry(f"+{x}+{y}")
+
+        times_window.transient(self.root) # Keep it on top of the main window
+        times_window.grab_set() # Modal behavior
+
+
+    def _display_processed_images_with_checkboxes(self):
+        # Clear previous content in scrollable_frame
+        for widget in self.scrollable_frame.winfo_children():
+            widget.destroy()
+        self.image_checkboxes.clear() # Clear old checkbox states
+
+        container_frame = Frame(self.scrollable_frame) # Main container for grid
+        container_frame.pack(expand=True, fill=tk.NONE, padx=10, pady=10)
+
+        num_columns = 4 # Number of images per row
+        # Filter out histogram data and sort by name
+        filtered_and_sorted_items = sorted(
+            [(name, data) for name, data in self.processed_images.items() if not name.startswith("Histogram")],
+            key=lambda x: x[0]
+        )
+
+        total_items = len(filtered_and_sorted_items)
+        if total_items == 0: return
+
+        # Configure grid weights for responsiveness (optional, but good practice)
+        total_rows = (total_items + num_columns - 1) // num_columns
+        for i in range(num_columns):
+            container_frame.columnconfigure(i, weight=1)
+        for i in range(total_rows):
+            container_frame.rowconfigure(i, weight=1)
+
+        row, col = 0, 0
+        for name, data_dict in filtered_and_sorted_items:
+            img_to_display = data_dict.get('image')
+            if img_to_display is None: continue
+
+            # Create a frame for each image + checkbox + label
+            item_frame = Frame(container_frame, bd=1, relief=tk.SUNKEN)
+            item_frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+
+            try:
+                # Convert image for Tkinter display
+                if img_to_display.ndim == 2: # Grayscale
+                    img_rgb = cv2.cvtColor(img_to_display, cv2.COLOR_GRAY2RGB)
+                elif img_to_display.shape[2] == 4: # BGRA
+                    img_rgb = cv2.cvtColor(img_to_display, cv2.COLOR_BGRA2RGB)
+                else: # BGR
+                    img_rgb = cv2.cvtColor(img_to_display, cv2.COLOR_BGR2RGB)
+
+                img_pil = Image.fromarray(img_rgb)
+                img_pil.thumbnail((150, 150), Image.Resampling.LANCZOS) # Resize for thumbnail
+                img_tk = ImageTk.PhotoImage(img_pil)
+
+                img_label = Label(item_frame, image=img_tk)
+                img_label.image = img_tk # Keep a reference
+                img_label.pack(padx=2, pady=2)
+
+                # Checkbox for selection
+                var = BooleanVar()
+                chk = Checkbutton(item_frame, text=name, variable=var, wraplength=140, justify=tk.LEFT)
+                chk.pack(padx=2, pady=(0,2), anchor='w')
+                self.image_checkboxes[name] = var # Store the BooleanVar
+
+            except Exception as e:
+                print(f"Error displaying image {name}: {e}")
+                Label(item_frame, text=f"{name}\n(Lỗi hiển thị)").pack()
+
+            col += 1
+            if col >= num_columns:
+                col = 0
+                row += 1
+        self.canvas.update_idletasks()
+        self.canvas.config(scrollregion=self.canvas.bbox("all"))
+
+
+    def process_image_filters(self, img_data):
+        # This function applies all defined filters to the input image
+        # It now expects img_data (the cv2 image object) directly.
+        if img_data is None:
+            return {} # Return empty if no image data
+
+        gray = cv2.cvtColor(img_data, cv2.COLOR_BGR2GRAY)
+
+        # Helper to time function execution
+        def timed_execution(func_to_execute):
+            start_time = time.perf_counter()
+            result = func_to_execute()
+            end_time = time.perf_counter()
+            duration_ms = (end_time - start_time) * 1000
+            return result, duration_ms
+
+        # Define all filter operations as lambdas
+        # Note: 'img_data.copy()' is used for filters modifying the original color image
+        # 'gray.copy()' for those operating on grayscale
+        tasks_definitions = {
+            "Original": lambda: img_data.copy(),
+            "Histogram Before": lambda: gray.copy(), # For histogram calculation
+            "Histogram After": lambda: cv2.equalizeHist(gray.copy()), # For histogram calculation
+            "R Channel": lambda: self._extract_channel(img_data.copy(), 2),
+            "G Channel": lambda: self._extract_channel(img_data.copy(), 1),
+            "B Channel": lambda: self._extract_channel(img_data.copy(), 0),
+            "Negative": lambda: self._negative_image(gray.copy()),
+            "Log Transform": lambda: self._log_transform(gray.copy()),
+            "Mean Filter": lambda: cv2.blur(img_data.copy(), (5, 5)),
+            "Median Filter": lambda: cv2.medianBlur(img_data.copy(), 5),
+            "Gaussian Filter": lambda: cv2.GaussianBlur(img_data.copy(), (5, 5), 0),
+            "Linear Sharpen": lambda: self._sharpen_filter(img_data.copy()),
+            "Gradient": lambda: self._gradient_filter(gray.copy()),
+            "Edge Detection": lambda: self._edge_detection(gray.copy()),
+            "Low Pass Filter": lambda: self._low_pass_filter(gray.copy()),
+            "High Pass Filter": lambda: self._high_pass_filter(gray.copy()),
+            "Bilateral Filter": lambda: cv2.bilateralFilter(img_data.copy(), 9, 75, 75),
+            "Non-Local Means": lambda: cv2.fastNlMeansDenoisingColored(img_data.copy(), None, 10, 10, 7, 21)
+        }
+
+        results_with_time = {}
+        num_workers = os.cpu_count() or 1 # Ensure at least 1 worker
+        # Use ThreadPoolExecutor for concurrent filter processing
+        with ThreadPoolExecutor(max_workers=min(num_workers, len(tasks_definitions))) as executor:
+            future_to_name = {
+                executor.submit(timed_execution, task_lambda): name
+                for name, task_lambda in tasks_definitions.items()
+            }
+
+            for future in future_to_name:
+                name = future_to_name[future]
+                try:
+                    processed_img_data, duration_ms = future.result()
+                    results_with_time[name] = {'image': processed_img_data, 'time_ms': duration_ms}
+                except Exception as e:
+                    print(f"Error processing filter '{name}': {e}")
+                    # Create a fallback black image if processing fails
+                    h, w = (img_data.shape[0], img_data.shape[1]) if img_data is not None and img_data.ndim >= 2 else (100, 100)
+                    # Determine if the filter was supposed to be color or grayscale
+                    is_color_filter = name not in ["Histogram Before", "Histogram After", "Negative", "Log Transform",
+                                                   "Gradient", "Edge Detection", "Low Pass Filter", "High Pass Filter"]
+                    if is_color_filter and img_data is not None and img_data.ndim == 3:
+                        fallback_image = np.zeros((h, w, img_data.shape[2]), dtype=np.uint8)
+                    else:
+                        fallback_image = np.zeros((h, w), dtype=np.uint8)
+                    results_with_time[name] = {'image': fallback_image, 'time_ms': 0.0, 'error': str(e)}
+        return results_with_time
+
+    # --- Filter Helper Methods ---
+    def _extract_channel(self, img, channel_idx):
+        channels = cv2.split(img)
+        if not all(c is not None for c in channels) or channel_idx >= len(channels):
+            return np.zeros_like(img[:,:,0]) # Fallback to a single channel zero array if split fails
+        # Create a blank image with the same number of channels as the original
+        zero_channel = np.zeros_like(channels[0])
+        result_channels = [zero_channel] * img.shape[2] # Initialize with zero channels
+        result_channels[channel_idx] = channels[channel_idx] # Set the desired channel
+        return cv2.merge(result_channels)
+
+
+    def _negative_image(self, gray):
+        return cv2.bitwise_not(gray)
+
+    def _log_transform(self, gray):
+        # Add a small epsilon to prevent log(0)
+        # Scale c based on max_val to ensure output is within 0-255
+        max_val = np.max(gray)
+        if max_val == 0: return gray # Avoid division by zero if image is all black
+        c = 255 / (np.log(1 + max_val) + 1e-5) # 1e-5 is epsilon
+        lut = np.array([c * np.log(1 + i) for i in range(256)], dtype=np.uint8)
+        log_img = cv2.LUT(gray, lut)
+        return log_img
+
+    def _sharpen_filter(self, img):
+        # Standard sharpening kernel
+        sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+        return cv2.filter2D(img, -1, sharpen_kernel) # -1 means output image has same depth as source
+
+    def _gradient_filter(self, gray):
+        # Using Scharr for potentially more accurate gradients than Sobel
+        grad_x = cv2.Scharr(gray, cv2.CV_32F, 1, 0)
+        grad_y = cv2.Scharr(gray, cv2.CV_32F, 0, 1)
+        magnitude = cv2.magnitude(grad_x, grad_y)
+        # Normalize to 0-255 and convert to uint8
+        result = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        return result
+
+    def _edge_detection(self, gray):
+        # Canny edge detection
+        edges = cv2.Canny(gray, 100, 200) # Thresholds can be tuned
+        return edges
+
+    def _frequency_domain_filter(self, gray, is_low_pass=True):
+        rows, cols = gray.shape
+        crow, ccol = rows // 2, cols // 2 # Center of the spectrum
+
+        # Create a mask (circular for simplicity)
+        y, x = np.ogrid[-crow:rows - crow, -ccol:cols - ccol]
+        mask_radius = 30 # Radius of the circular mask, can be a parameter
+        mask_area = x * x + y * y <= mask_radius * mask_radius
+
+        if is_low_pass:
+            mask = np.zeros((rows, cols), np.float32)
+            mask[mask_area] = 1 # Pass frequencies within the circle
+        else: # High-pass
+            mask = np.ones((rows, cols), np.float32)
+            mask[mask_area] = 0 # Block frequencies within the circle
+
+        # Apply Gaussian blur to the mask for smoother transition (reduces ringing)
+        mask = cv2.GaussianBlur(mask, (21, 21), 0)
+
+
+        # DFT
+        gray_float = gray.astype(np.float32)
+        dft = cv2.dft(gray_float, flags=cv2.DFT_COMPLEX_OUTPUT)
+        dft_shift = np.fft.fftshift(dft) # Shift zero-frequency component to center
+
+        # Apply mask in frequency domain
+        # Mask needs to be duplicated for real and imaginary parts if dft_shift has 2 channels
+        fshift_real = dft_shift[:,:,0] * mask
+        fshift_imag = dft_shift[:,:,1] * mask
+        fshift = np.dstack((fshift_real, fshift_imag))
+
+
+        # Inverse DFT
+        f_ishift = np.fft.ifftshift(fshift)
+        img_back = cv2.idft(f_ishift)
+        img_back = cv2.magnitude(img_back[:, :, 0], img_back[:, :, 1]) # Compute magnitude
+
+        # Normalize and convert back to uint8
+        img_back = cv2.normalize(img_back, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        return img_back
+
+    def _low_pass_filter(self, gray):
+        return self._frequency_domain_filter(gray, is_low_pass=True)
+
+    def _high_pass_filter(self, gray):
+        return self._frequency_domain_filter(gray, is_low_pass=False)
+
+
+    def display_histogram(self):
+        for widget in self.hist_frame.winfo_children():
+            widget.destroy()
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8, 3)) # Adjust figsize as needed
+        fig.patch.set_facecolor('#f0f0f0') # Match Tkinter default background
+
+        # Histogram Before
+        hist_before_data = self.processed_images.get("Histogram Before")
+        if hist_before_data and 'image' in hist_before_data:
+            hist_before_img = hist_before_data['image']
+            # Ensure it's grayscale for histogram calculation
+            if hist_before_img.ndim == 3: hist_before_img = cv2.cvtColor(hist_before_img, cv2.COLOR_BGR2GRAY)
+            hist_calc_before = cv2.calcHist([hist_before_img], [0], None, [256], [0, 256])
+            ax1.plot(hist_calc_before, color='blue')
+            ax1.set_title("Histogram Trước", fontsize=10)
+            ax1.tick_params(axis='both', which='major', labelsize=8)
+            ax1.grid(True, linestyle='--', alpha=0.6)
+        else:
+            ax1.set_title("Histogram Trước (N/A)", fontsize=10)
+            ax1.grid(True, linestyle='--', alpha=0.6)
+
+
+        # Histogram After (typically after equalization)
+        hist_after_data = self.processed_images.get("Histogram After")
+        if hist_after_data and 'image' in hist_after_data:
+            hist_after_img = hist_after_data['image']
+            if hist_after_img.ndim == 3: hist_after_img = cv2.cvtColor(hist_after_img, cv2.COLOR_BGR2GRAY)
+            hist_calc_after = cv2.calcHist([hist_after_img], [0], None, [256], [0, 256])
+            ax2.plot(hist_calc_after, color='green')
+            ax2.set_title("Histogram Sau (Cân bằng)", fontsize=10)
+            ax2.tick_params(axis='both', which='major', labelsize=8)
+            ax2.grid(True, linestyle='--', alpha=0.6)
+        else:
+            ax2.set_title("Histogram Sau (N/A)", fontsize=10)
+            ax2.grid(True, linestyle='--', alpha=0.6)
+
+
+        plt.tight_layout(pad=1.5)
+
+        hist_path = ""
+        if self.current_output_folder and os.path.isdir(self.current_output_folder):
+             # Use a fixed name for the histogram image within the current image's subfolder
+            hist_path = os.path.join(self.current_output_folder, "Biểu_đồ_Histogram.png")
+            try:
+                fig.savefig(hist_path, facecolor=fig.get_facecolor(), dpi=100) # Save with decent DPI
+            except Exception as e:
+                print(f"Lỗi lưu biểu đồ histogram: {e}")
+                hist_path = "" # Invalidate path if save fails
+        else:
+            print("Thư mục lưu histogram không hợp lệ, histogram sẽ không được lưu vào file.")
+
+        plt.close(fig) # Close the figure to free memory
+
+        # Display the saved histogram image in the Tkinter frame
+        if hist_path and os.path.exists(hist_path):
+            try:
+                hist_img_pil = Image.open(hist_path)
+                # Resize to fit the hist_frame
+                max_width = self.hist_frame.winfo_width() if self.hist_frame.winfo_width() > 1 else 500
+                max_height = self.hist_frame.winfo_height() if self.hist_frame.winfo_height() > 1 else 250
+                hist_img_pil.thumbnail((max_width - 20, max_height - 20), Image.Resampling.LANCZOS) # -20 for padding
+
+                hist_tk = ImageTk.PhotoImage(hist_img_pil)
+                label = Label(self.hist_frame, image=hist_tk)
+                label.image = hist_tk # Keep reference
+                label.pack(padx=10, pady=10, expand=True)
+            except Exception as e:
+                print(f"Error displaying histogram image: {e}")
+                Label(self.hist_frame, text="Lỗi hiển thị histogram.").pack(padx=10, pady=10)
+        else:
+            Label(self.hist_frame, text="Không thể tạo/hiển thị histogram (chưa chọn thư mục lưu hợp lệ).").pack(padx=10, pady=10)
+
+    def save_selected_images_threaded(self):
+        # Run saving in a thread to avoid freezing GUI
+        threading.Thread(target=self.save_selected_images, daemon=True).start()
+
+    def save_selected_images(self):
+        if not self.current_output_folder or not os.path.isdir(self.current_output_folder):
+            self.root.after(0, lambda: messagebox.showerror("Lỗi Lưu Ảnh",
+                                                            "Không thể lưu ảnh.\nVui lòng chọn thư mục lưu kết quả hợp lệ và xử lý lại ảnh."))
+            return
+
+        self.root.after(0, lambda: self.progress_label.config(text="Đang lưu ảnh đã chọn..."))
+        self.root.after(0, lambda: self.save_selected_button.config(state=tk.DISABLED))
+
+
+        saved_count = 0
+        selected_to_save = []
+
+        for name, var in self.image_checkboxes.items():
+            if var.get(): # If checkbox is ticked
+                if name in self.processed_images and 'image' in self.processed_images[name]:
+                    selected_to_save.append(name)
+                else:
+                    print(f"Dữ liệu ảnh cho '{name}' không tìm thấy để lưu.")
+
+        if not selected_to_save:
+            self.root.after(0, lambda: messagebox.showinfo("Không có ảnh nào được chọn", "Vui lòng chọn ít nhất một ảnh để lưu."))
+            self.root.after(0, lambda: self.progress_label.config(text="Lưu ảnh: Chưa có ảnh nào được chọn."))
+            self.root.after(0, lambda: self.save_selected_button.config(state=tk.NORMAL))
+            return
+
+        for name in selected_to_save:
+            data_dict = self.processed_images[name]
+            img_to_save = data_dict.get('image')
+
+            if img_to_save is None:
+                print(f"Bỏ qua lưu ảnh '{name}', không có dữ liệu ảnh.")
+                continue
+
+            # Ensure image is in BGR format for saving with OpenCV if it's color
+            # If it's grayscale, imwrite handles it. If BGRA, convert to BGR.
+            if img_to_save.ndim == 2:  # Grayscale, imwrite handles this
+                pass
+            elif img_to_save.shape[2] == 4:  # BGRA
+                img_to_save = cv2.cvtColor(img_to_save, cv2.COLOR_BGRA2BGR)
+            # If BGR, no conversion needed.
+
+            # Filename is the filter name
+            file_name = f"{name.replace(' ', '_').replace('/', '-')}.png" # Replace spaces and slashes
+            output_path = os.path.join(self.current_output_folder, file_name)
+
+            try:
+                cv2.imwrite(output_path, img_to_save)
+                saved_count += 1
+                print(f"Đã lưu: {output_path}")
+            except Exception as e:
+                print(f"Lỗi khi lưu ảnh {output_path}: {e}")
+                self.root.after(0, lambda name_copy=name, e_copy=e: messagebox.showerror("Lỗi Lưu Ảnh", f"Không thể lưu ảnh '{name_copy}':\n{e_copy}"))
+
+
+        if saved_count > 0:
+            self.root.after(0, lambda: messagebox.showinfo("Lưu Thành Công",
+                                                            f"Đã lưu {saved_count} ảnh đã chọn vào thư mục:\n{self.current_output_folder}"))
+            self.root.after(0, lambda: self.progress_label.config(text=f"Đã lưu {saved_count} ảnh!"))
+        elif selected_to_save: # Some were selected but none saved (due to errors)
+             self.root.after(0, lambda: self.progress_label.config(text="Lưu ảnh: Có lỗi xảy ra, không lưu được ảnh nào."))
+        # If no images were selected, the message is handled earlier.
+
+        self.root.after(0, lambda: self.save_selected_button.config(state=tk.NORMAL))
+
+
+if __name__ == "__main__":
+    root = Tk()
+    app = ImageProcessingApp(root)
+    root.geometry("850x750") # Slightly larger default size
+    root.minsize(750, 650)  # Adjusted minsize
+    root.mainloop()
