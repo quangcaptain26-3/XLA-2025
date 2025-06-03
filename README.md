@@ -219,7 +219,7 @@ processor.show_results([img, enhanced_img, filtered_img, edges],
 | 📱 Kênh liên lạc | Thông tin |
 |------------------|-----------|
 | 👤 Author | Quang Captain |
-| 📧 Email | [quangcaptain26@gmail.com](mailto:quangcaptain26@gmail.com) |
+| 📧 Email | [quangcaptain26@gmail.com](mailto:phamminhquang2603@gmail.com) |
 | 🌐 GitHub | [@quangcaptain26-3](https://github.com/quangcaptain26-3) |
 
 </div>
